@@ -1,9 +1,11 @@
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
+import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
 import { mock } from 'jest-mock-extended';
 
 import { AwsSecretsManager, type AwsSecretsManagerContext } from '../aws-secrets-manager';
 
 jest.mock('@aws-sdk/client-secrets-manager');
+jest.mock('@aws-sdk/client-sts');
 
 describe('AwsSecretsManager', () => {
 	const region = 'eu-central-1';
@@ -164,5 +166,196 @@ describe('AwsSecretsManager', () => {
 		expect(awsSecretsManager.getSecret('secret1')).toBe('secret1-value');
 		expect(awsSecretsManager.getSecret('secret2')).toBe('secret2-value');
 		expect(awsSecretsManager.getSecret('secret3')).toBe('secret3-value');
+	});
+
+	describe('STS Cross-Account Authentication', () => {
+		const mockSend = jest.fn();
+
+		beforeEach(() => {
+			// Mock STSClient constructor and send method
+			(STSClient as jest.MockedClass<typeof STSClient>).mockImplementation(
+				() =>
+					({
+						send: mockSend,
+					}) as any,
+			);
+		});
+
+		it('should successfully assume role with STS', async () => {
+			const roleArn = 'arn:aws:iam::123456789012:role/CrossAccountSecretsRole';
+			const externalId = 'unique-external-id';
+			const sessionName = 'n8n-test-session';
+
+			context.settings = {
+				region,
+				authMethod: 'iamUser',
+				accessKeyId,
+				secretAccessKey,
+				stsRoleArn: roleArn,
+				stsExternalId: externalId,
+				stsSessionName: sessionName,
+			};
+
+			// Mock successful STS assume role response
+			mockSend.mockResolvedValueOnce({
+				Credentials: {
+					AccessKeyId: 'ASSUMED-ACCESS-KEY',
+					SecretAccessKey: 'ASSUMED-SECRET-KEY',
+					SessionToken: 'ASSUMED-SESSION-TOKEN',
+					Expiration: new Date(Date.now() + 3600000), // 1 hour from now
+				},
+			});
+
+			await awsSecretsManager.init(context);
+
+			// Verify STS was called with correct parameters
+			expect(mockSend).toHaveBeenCalledWith(
+				expect.objectContaining({
+					input: {
+						RoleArn: roleArn,
+						RoleSessionName: sessionName,
+						ExternalId: externalId,
+					},
+				}),
+			);
+
+			// Verify SecretsManager was initialized with assumed role credentials
+			expect(SecretsManager).toHaveBeenCalledWith({
+				region,
+				credentials: {
+					accessKeyId: 'ASSUMED-ACCESS-KEY',
+					secretAccessKey: 'ASSUMED-SECRET-KEY',
+					sessionToken: 'ASSUMED-SESSION-TOKEN',
+				},
+			});
+		});
+
+		it('should assume role without external ID when not provided', async () => {
+			const roleArn = 'arn:aws:iam::123456789012:role/CrossAccountSecretsRole';
+
+			context.settings = {
+				region,
+				authMethod: 'autoDetect',
+				stsRoleArn: roleArn,
+				// No external ID or session name provided
+			};
+
+			mockSend.mockResolvedValueOnce({
+				Credentials: {
+					AccessKeyId: 'ASSUMED-ACCESS-KEY',
+					SecretAccessKey: 'ASSUMED-SECRET-KEY',
+					SessionToken: 'ASSUMED-SESSION-TOKEN',
+					Expiration: new Date(Date.now() + 3600000),
+				},
+			});
+
+			await awsSecretsManager.init(context);
+
+			expect(mockSend).toHaveBeenCalledWith(
+				expect.objectContaining({
+					input: {
+						RoleArn: roleArn,
+						RoleSessionName: 'n8n-external-secrets', // Default session name
+						// ExternalId should not be present
+					},
+				}),
+			);
+		});
+
+		it('should handle STS assume role failure', async () => {
+			const roleArn = 'arn:aws:iam::123456789012:role/InvalidRole';
+
+			context.settings = {
+				region,
+				authMethod: 'iamUser',
+				accessKeyId,
+				secretAccessKey,
+				stsRoleArn: roleArn,
+			};
+
+			// Mock STS failure
+			mockSend.mockRejectedValueOnce(new Error('Access denied'));
+
+			await expect(awsSecretsManager.init(context)).rejects.toThrow('Access denied');
+		});
+
+		it('should handle missing credentials in STS response', async () => {
+			const roleArn = 'arn:aws:iam::123456789012:role/CrossAccountSecretsRole';
+
+			context.settings = {
+				region,
+				authMethod: 'iamUser',
+				accessKeyId,
+				secretAccessKey,
+				stsRoleArn: roleArn,
+			};
+
+			// Mock STS response without credentials
+			mockSend.mockResolvedValueOnce({
+				Credentials: undefined,
+			});
+
+			await expect(awsSecretsManager.init(context)).rejects.toThrow(
+				'Failed to assume role: No credentials returned',
+			);
+		});
+
+		it('should fall back to regular authentication when no STS role is configured', async () => {
+			context.settings = {
+				region,
+				authMethod: 'iamUser',
+				accessKeyId,
+				secretAccessKey,
+				// No STS configuration
+			};
+
+			await awsSecretsManager.init(context);
+
+			// STS should not be called
+			expect(mockSend).not.toHaveBeenCalled();
+
+			// SecretsManager should be initialized with regular credentials
+			expect(SecretsManager).toHaveBeenCalledWith({
+				region,
+				credentials: {
+					accessKeyId,
+					secretAccessKey,
+				},
+			});
+		});
+
+		it('should work with autoDetect authentication and STS', async () => {
+			const roleArn = 'arn:aws:iam::123456789012:role/CrossAccountSecretsRole';
+
+			context.settings = {
+				region,
+				authMethod: 'autoDetect',
+				stsRoleArn: roleArn,
+			};
+
+			mockSend.mockResolvedValueOnce({
+				Credentials: {
+					AccessKeyId: 'ASSUMED-ACCESS-KEY',
+					SecretAccessKey: 'ASSUMED-SECRET-KEY',
+					SessionToken: 'ASSUMED-SESSION-TOKEN',
+					Expiration: new Date(Date.now() + 3600000),
+				},
+			});
+
+			await awsSecretsManager.init(context);
+
+			// STS client should be created without explicit credentials (autoDetect)
+			expect(STSClient).toHaveBeenCalledWith({ region });
+
+			// SecretsManager should use assumed role credentials
+			expect(SecretsManager).toHaveBeenCalledWith({
+				region,
+				credentials: {
+					accessKeyId: 'ASSUMED-ACCESS-KEY',
+					secretAccessKey: 'ASSUMED-SECRET-KEY',
+					sessionToken: 'ASSUMED-SESSION-TOKEN',
+				},
+			});
+		});
 	});
 });
